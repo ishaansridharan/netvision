@@ -182,6 +182,49 @@ evaluation/            metrics, run_eval, benchmark, charts, labels, mark, sampl
 tests/                 parser, flows, stats, baselines, detectors, engine, API, evaluation
 ```
 
+## Status and remaining work
+
+The pipeline, all four detectors in both modes, the API, the database, the five-view dashboard and the evaluation harness are implemented and tested. Two goals from the project report are still open.
+
+### Implemented
+
+Mapped to the report's pipeline: Capture → Parse → Flow Tracking → Statistics → Detection → Visualization.
+
+| Stage | What is implemented | Where |
+|---|---|---|
+| **Capture** | Live capture from an interface (optional BPF filter), and replay of `.pcap`/`.pcapng` files at original pace or faster. The capture thread only enqueues raw frames; one analysis worker does the rest, and packets the queue can't accept are counted as drops. Clear error messages when capture privileges are missing. | `capture/engine.py`, `capture/pcapfile.py`, `capture/interface.py` |
+| **Parse** | Ethernet (incl. VLAN tags), ARP, IPv4 (options, fragments), ICMP (echo id/seq), TCP (flags, seq/ack, payload length), UDP and DNS (queries, answers, name compression). A byte-level parser handles about 80k packets/s and is checked field by field against a Scapy reference parser. | `parser/fast_parser.py`, `parser/packet_parser.py` |
+| **Flow tracking** | Bidirectional 5-tuple flows that remember the initiator. A TCP state machine covers SYN_SENT → SYN_RECEIVED → ESTABLISHED → FIN_WAIT → CLOSED/RESET, with a half-open flag, handshake RTT and retransmission counting. Expiry depends on state, and a hard cap protects against floods. | `analyzer/flow_tracker.py` |
+| **Statistics** | Upload/download/LAN bandwidth over 10 s windows plus a 1 s rate. Packets/s, protocol mix, and top talkers and destinations with DNS-resolved names. Latency (median and p95 from ping and handshake RTTs), jitter, a loss estimate, active and half-open connections, and a 0–100 health score that explains each component and names the host responsible. | `analyzer/stats_engine.py`, `analyzer/hosts.py` |
+| **Detection** | Port scan, SYN flood, ARP anomaly and traffic spike, each in static and adaptive mode, switchable at runtime. Adaptive baselines are EWMA mean/variance with z-scores, per-host where history exists, and protected against learning from attacks or idle time. Every alert carries an explanation: rule, observed value, threshold, baseline and supporting evidence. Details in [Detection](#detection). | `detection/` |
+| **Storage** | SQLite holds alerts (with explanations and status changes), completed flows and 1-second stats snapshots. Writes go through a background writer, alerts are restored on restart, and old data is pruned on a schedule. | `storage/` |
+| **API** | REST endpoints for capture, packets, flows, stats, hosts, topology, alerts, detection mode and baselines, reports and pipeline metrics, plus a WebSocket that pushes updates every 500 ms. Details in [API](#api). | `api/`, `main.py` |
+| **Visualization** | The five views from the report, with light and dark themes. **Dashboard:** health breakdown, KPIs, traffic chart, protocols, top sources, recent alerts. **Live Packets:** filters, pause, per-layer detail. **Network Map:** force-directed host graph plus a connections table. **Security:** mode switch, alert list with explanation panel, acknowledge/resolve, live baselines, ARP table. **Reports:** "why is my network slow?" diagnosis, history trends, top devices and services, alert history, processing performance, evaluation results. | `frontend/src/` |
+| **Evaluation** | Labelling tool, a scorer that replays a capture through static and adaptive pipelines side by side (precision, recall, F1, false-positive rate, false alerts per hour, detection latency, offline throughput, with tables and charts), a live-path throughput and drop-rate benchmark, and a benign sample capture for demos. Details in [Evaluation](#evaluation-static-vs-adaptive). | `evaluation/` |
+| **Tests** | 74 tests covering the parsers, flows, stats, baselines, all detectors in both modes, the capture engine, the API (including replay end to end) and the evaluation harness. | `tests/` |
+
+### Open goals
+
+1. **Static-vs-adaptive results.** The report promises comparison tables and graphs (precision, recall, F1, false-positive rate, detection latency) on mixed normal and attack traffic. The harness that produces them works, but it hasn't been run on real data. The only capture so far is the generated benign sample, which shows the harness works and nothing about which mode is better. The claim that adaptive detection reduces false positives is **not yet demonstrated**. To close it:
+   - Set up an isolated lab (two or three VMs, or Linux network namespaces) that you control.
+   - Record normal traffic plus the report's scenarios (port scan, SYN flood, ARP spoofing), labelling each with `evaluation.mark`.
+   - Also record legitimate look-alikes (a large download, a busy server, a DHCP re-assignment) and leave them **unlabelled**. They are where static thresholds should produce false positives and adaptive detection should not.
+   - Record several runs so the results don't rest on a single capture, then follow [Evaluation](#evaluation-static-vs-adaptive).
+2. **Live capture on a real interface.** The live capture loop has only been tested with a simulated socket. It still needs one manual session on a real Linux interface, and one on Windows with Npcap (the report's stated platform, not yet run at all).
+
+### Not yet done
+
+- **Threshold sweep.** k = 3, α = 0.05 and the floors are reasonable defaults, not values tuned on data. Once lab captures exist, sweeping k and plotting detection rate against false-positive rate (an ROC-style curve) would strengthen the evaluation. `run_eval` doesn't support sweeps yet.
+- **Direction on the Network Map.** Per-direction byte counts are in the Connections table, but the graph doesn't draw direction arrows.
+- **Frontend tests.** The UI has no automated tests. It was checked by screenshots in light mode at desktop width only; dark mode and narrow screens haven't been verified.
+
+### Suggested order
+
+1. Run a live capture on Linux, then on Windows.
+2. Record two or three labelled lab captures.
+3. Run the evaluation and add the threshold sweep.
+4. Put the resulting tables and charts into the report.
+
 ## Known limitations
 
 - **IPv4 only.** IPv6 frames are skipped.
@@ -190,3 +233,4 @@ tests/                 parser, flows, stats, baselines, detectors, engine, API, 
 - **Adaptive warm-up.** Detectors use the static rule for the first ~30 s of observation. A host's own baseline adapts to lasting behaviour changes over minutes, deliberately, so an attacker can't retrain it quickly.
 - **ARP adaptive mode** needs to have seen the old MAC to judge whether it's still alive. The OS ARP cache is used as a seed at capture start.
 - **Throughput.** Analysis is single-threaded Python, at roughly 30k packets/s sustained on one core.
+- **No authentication.** The API has no login and CORS allows any origin, so anyone who can reach the port can view traffic and start or stop capture. Keep the server bound to `127.0.0.1` (as in [Quick start](#quick-start)) unless the network is trusted.
