@@ -1,124 +1,195 @@
 """
 NetVision — Traffic Spike Detector (detection/traffic_spike.py)
 
-Detection logic
-───────────────
-We maintain an exponential moving average (EMA) of bytes/sec as a
-rolling baseline representing "normal" traffic for this network.
+Signal
+──────
+Total throughput of the last complete second (bytes/sec), taken from the
+stats snapshot on every tick.  The 1-second value is used rather than the
+10-second rolling average so a spike is not smoothed away before it is
+detected.
 
-On each update, if the current measurement exceeds:
-    baseline * spike_multiplier
-
-and the baseline is large enough to be meaningful (> min_baseline),
-we generate a TRAFFIC_SPIKE alert.
-
-EMA formula
+Static mode
 ───────────
-    new_baseline = α * current_rate + (1 - α) * old_baseline
+    throughput ≥ traffic_spike_static_bps            (default 10 Mbit/s)
 
-Where α (alpha) controls how quickly the baseline adapts:
-    • Small α (0.05) → slow adaptation, stable baseline
-    • Large α (0.5)  → fast adaptation, baseline tracks traffic closely
+A fixed number is either too low for a busy network (constant alerts) or
+too high for a quiet one (spikes missed) — the problem the report sets
+out to fix.
 
-We use α = 0.05 by default so that a spike cannot quickly raise the
-baseline and hide itself.
+Adaptive mode
+─────────────
+EWMA baseline of per-second throughput (see detection/baseline.py):
 
-Alert cooldown
-──────────────
-Minimum 30 seconds between consecutive spike alerts to avoid flooding.
+    throughput ≥ max(μ + k·σ,  multiplier·μ,  min_bps)
+
+  • μ + k·σ        — statistically unusual for this network
+  • multiplier·μ   — and a material jump, not a wobble on a flat baseline
+  • min_bps        — and large enough in absolute terms to matter
+
+While the baseline is warming up the detector falls back to the static
+threshold, and says so in the explanation.
+
+Both modes require `traffic_spike_min_duration_s` consecutive anomalous
+seconds, which filters single-second bursts (a page load, a TCP slow-start
+overshoot), and respect a cooldown between alerts.
 """
 
 from __future__ import annotations
 
-import threading
-import time
 from typing import Optional
 
-from backend.config import settings
-from backend.detection.models import Alert
-from backend.parser.packet_parser import PacketRecord
+from backend.config import Settings, settings as default_settings
+from backend.detection.baseline import EWMABaseline
+from backend.detection.models import Alert, explain
 
 
 class TrafficSpikeDetector:
-    """
-    EMA-based traffic spike detector.
+    """EWMA + z-score traffic spike detector (static or adaptive)."""
 
-    Updated once per second (or whenever the stats engine calls update()).
-    Can also be driven directly from packets via process(), but the
-    bandwidth measurement is coarser in that mode.
-    """
+    def __init__(self, cfg: Settings = default_settings, mode: str = "adaptive") -> None:
+        self._cfg = cfg
+        self.mode = mode
+        self._baseline = EWMABaseline(
+            alpha=cfg.baseline_alpha,
+            k=cfg.baseline_z_threshold,
+            warmup=cfg.baseline_warmup_samples,
+            floor=cfg.traffic_spike_min_bps,
+            min_std=10_000.0,   # 10 kB/s — σ below this is measurement noise
+            cold_clip=cfg.traffic_spike_static_bps,
+        )
+        self._consecutive = 0
+        self._spike_started: Optional[float] = None
+        self._last_alert_time = float("-inf")
 
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._baseline_bps: float = 0.0
-        self._last_alert_time: float = 0.0
-        self._cooldown_s: float = 30.0
+    def pause(self) -> None:
+        """Not observing: forget any partial spike; the baseline is untouched."""
+        self._consecutive = 0
+        self._spike_started = None
 
-        # For packet-driven bandwidth estimation
-        self._window_start: float = time.time()
-        self._window_bytes: int = 0
-
-    def update_from_stats(
-        self, current_bps: float, top_source_ip: Optional[str] = None
+    def check(
+        self,
+        now: float,
+        current_bps: float,
+        top_talkers: Optional[list[dict]] = None,
     ) -> Optional[Alert]:
-        """
-        Called by the stats engine each snapshot with the current bandwidth.
-        Returns an Alert if a spike is detected, else None.
-        """
-        alpha = settings.traffic_spike_ema_alpha
-        multiplier = settings.traffic_spike_multiplier
-        min_baseline = settings.traffic_spike_min_baseline
+        """Called once per tick with the last full second's throughput."""
+        cfg = self._cfg
+        b = self._baseline
 
-        now = time.time()
+        # Decide against the baseline *before* learning from this sample.
+        mean, std, ready = b.mean, b.std, b.ready
+        z = b.z_score(current_bps) if b.n else None
+        if self.mode == "static" or not ready:
+            threshold = cfg.traffic_spike_static_bps
+            rule = f"throughput ≥ {_rate(threshold)} (fixed)"
+            if self.mode == "adaptive":
+                rule += f" — baseline warming up ({b.n}/{b.warmup} s)"
+        else:
+            threshold = max(b.threshold(), cfg.traffic_spike_multiplier * mean,
+                            cfg.traffic_spike_min_bps)
+            rule = "throughput ≥ max(μ + k·σ, multiplier·μ, min_bps)"
 
-        with self._lock:
-            # Update EMA baseline
-            if self._baseline_bps == 0.0:
-                self._baseline_bps = current_bps
-            else:
-                self._baseline_bps = (
-                    alpha * current_bps + (1 - alpha) * self._baseline_bps
-                )
+        anomalous = current_bps >= threshold
+        b.update(current_bps)
 
-            baseline = self._baseline_bps
+        if anomalous:
+            if self._consecutive == 0:
+                self._spike_started = now - 1.0   # the sample covers the previous second
+            self._consecutive += 1
+        else:
+            self._consecutive = 0
+            self._spike_started = None
 
-            # Don't alert until baseline is meaningful
-            if baseline < min_baseline:
-                return None
+        if self._consecutive < cfg.traffic_spike_min_duration_s:
+            return None
+        if now - self._last_alert_time < cfg.traffic_spike_cooldown_s:
+            return None
+        self._last_alert_time = now
 
-            # Check for spike
-            if current_bps < baseline * multiplier:
-                return None
+        top = (top_talkers or [None])[0]
+        top_ip = top["ip"] if top else None
+        current_mbps = current_bps * 8 / 1e6
+        baseline_mbps = mean * 8 / 1e6
+        factors = [
+            f"Above threshold for {self._consecutive} consecutive seconds.",
+        ]
+        if top:
+            factors.append(
+                f"Largest contributor: {top.get('name') or top_ip} "
+                f"({top['pct']:.0f}% of traffic in the last "
+                f"{cfg.stats_rolling_window_s:.0f}s)."
+            )
+        if mean > 0:
+            factors.append(f"{current_bps / mean:.1f}× the baseline mean.")
 
-            # Cooldown check
-            if now - self._last_alert_time < self._cooldown_s:
-                return None
+        adaptive_decision = self.mode == "adaptive" and ready
+        if adaptive_decision:
+            summary = (
+                f"Throughput jumped to {_rate(current_bps)}; normal for this "
+                f"network is {_rate(mean)} ± {_rate(std)}, so anything above "
+                f"{_rate(threshold)} is unusual."
+            )
+        else:
+            summary = (
+                f"Throughput reached {_rate(current_bps)}, above the fixed "
+                f"threshold of {_rate(threshold)}."
+            )
 
-            self._last_alert_time = now
-
-        current_mbps = current_bps / 1_000_000
-        baseline_mbps = baseline / 1_000_000
-
+        severity = "HIGH" if current_bps >= 3 * threshold else "MEDIUM"
         return Alert(
+            timestamp=now,
             alert_type="TRAFFIC_SPIKE",
-            severity="MEDIUM",
-            source_ip=top_source_ip,
+            severity=severity,
+            mode=self.mode,
+            source_ip=top_ip,
             target_ip=None,
             description=(
-                f"Unusual traffic spike detected: "
-                f"{current_mbps:.1f} Mbps (baseline: {baseline_mbps:.1f} Mbps, "
-                f"{multiplier:.0f}× threshold)."
+                f"Unusual traffic spike: {_rate(current_bps)} (baseline {_rate(mean)})."
             ),
             evidence={
                 "current_bps": round(current_bps),
-                "baseline_bps": round(baseline),
-                "multiplier": multiplier,
-                "current_mbps": round(current_mbps, 2),
-                "baseline_mbps": round(baseline_mbps, 2),
-                "top_source": top_source_ip,
+                "baseline_bps": round(mean),
+                "baseline_std_bps": round(std),
+                "threshold_bps": round(threshold),
+                "current_mbps": round(current_mbps, 3),
+                "baseline_mbps": round(baseline_mbps, 3),
+                "consecutive_seconds": self._consecutive,
+                "spike_started": self._spike_started,
+                "top_source": top_ip,
+                "top_source_pct": top["pct"] if top else None,
             },
+            explanation=explain(
+                summary=summary,
+                metric="total throughput over the last second",
+                observed=current_bps,
+                threshold=threshold,
+                rule=rule,
+                baseline=b.view("network") if adaptive_decision else None,
+                z_score=z if adaptive_decision else None,
+                factors=factors,
+            ),
         )
 
+    def baseline_summary(self) -> dict:
+        b = self._baseline
+        return {
+            "population": b.view("network").to_dict(),
+            "current_threshold_bps": round(
+                max(b.threshold(), self._cfg.traffic_spike_multiplier * b.mean,
+                    self._cfg.traffic_spike_min_bps)
+                if b.ready else self._cfg.traffic_spike_static_bps
+            ),
+        }
+
     def get_baseline_mbps(self) -> float:
-        with self._lock:
-            return self._baseline_bps / 1_000_000
+        return self._baseline.mean * 8 / 1e6
+
+
+def _rate(bytes_per_s: float) -> str:
+    """Bytes/s as a human bit rate with a unit chosen by magnitude."""
+    bits = bytes_per_s * 8
+    if bits >= 1e9:
+        return f"{bits / 1e9:.2f} Gbit/s"
+    if bits >= 1e6:
+        return f"{bits / 1e6:.2f} Mbit/s"
+    return f"{bits / 1e3:.1f} kbit/s"

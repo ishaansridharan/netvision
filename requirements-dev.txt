@@ -1,0 +1,5 @@
+# Tests and the evaluation harness (on top of backend/requirements.txt)
+-r backend/requirements.txt
+pytest>=8.0
+httpx>=0.27
+matplotlib>=3.8

@@ -1,114 +1,248 @@
 """
 NetVision — Port Scan Detector (detection/port_scan.py)
 
-Detection logic
-───────────────
-Track distinct destination ports contacted by each source IP within a
-configurable sliding time window.  If a single source touches more than
-`port_scan_threshold` distinct ports within `port_scan_window_s` seconds,
-generate a PORT_SCAN alert.
+Signal: distinct-port fan-out
+─────────────────────────────
+For each source IP we track the *connection attempts* it initiated within a
+sliding window (`port_scan_window_s`): new TCP flows opened with a SYN, and
+new UDP flows.  The fan-out is the number of distinct destination ports in
+that window.
 
-Why this catches port scans
-────────────────────────────
-A normal client connects to a small number of ports (443, 80, 53, …).
-A port scanner rapidly connects to many different destination ports on
-one or more targets.  The ratio of distinct ports to time is the signal.
+Working from flow-level connection attempts (instead of raw packets) is
+what keeps busy servers quiet: a web server replying to a hundred clients
+sends packets to a hundred different client ports, but those packets all
+belong to flows the *clients* initiated, so they never count against the
+server.
+
+Static mode
+───────────
+    fan_out ≥ port_scan_threshold                    (default 15)
+
+Adaptive mode
+─────────────
+    fan_out ≥ max(floor, μ + k·σ)
+
+where μ, σ come from an EWMA baseline of fan-out sampled every second.
+Each source is judged against its *own* baseline once that has warmed up,
+and against the network-wide (population) baseline before then.  A host
+that legitimately talks to many ports (P2P client, monitoring server)
+raises its own threshold instead of alerting forever.
+
+Supporting evidence (flow context)
+──────────────────────────────────
+  • failed ratio — share of attempted TCP connections that were refused
+    (RST) or are still unanswered.  Scans hit mostly closed ports, so this
+    is high; a legitimate burst of connections mostly succeeds.
+  • distinct targets — one target = vertical scan, many = sweep.
+High failed ratio raises severity to HIGH.
 
 Alert cooldown
 ──────────────
-After an alert fires for a source IP, that IP is put in a cooldown
-period (equal to the window size) to avoid alert storms.
+After an alert, the source is muted for `port_scan_cooldown_s` to avoid
+alert storms while the scan continues.
 """
 
 from __future__ import annotations
 
-import threading
-import time
-from collections import defaultdict, deque
+from collections import Counter, deque
 from typing import Optional
 
-from backend.config import settings
-from backend.detection.models import Alert
+from backend.analyzer.flow_tracker import FlowEvent, FlowRecord
+from backend.config import Settings, settings as default_settings
+from backend.detection.baseline import BaselineTable
+from backend.detection.models import Alert, explain
 from backend.parser.packet_parser import PacketRecord
 
 
-class PortScanDetector:
-    """
-    Sliding-window port scan detector.
+class _SourceWindow:
+    """Connection attempts by one source within the sliding window."""
 
-    State per source IP:
-        deque of (timestamp, dst_ip, dst_port) tuples within the window.
-    """
+    __slots__ = ("attempts", "port_counts", "host_counts")
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
-        # src_ip → deque[(timestamp, dst_ip, dst_port)]
-        self._activity: dict[str, deque] = defaultdict(
-            lambda: deque()
-        )
-        # src_ip → last alert timestamp (for cooldown)
-        self._last_alert: dict[str, float] = {}
+        self.attempts: deque[tuple[float, str, int, FlowRecord]] = deque()
+        self.port_counts: Counter = Counter()
+        self.host_counts: Counter = Counter()
 
-    def process(self, pkt: PacketRecord) -> Optional[Alert]:
-        """
-        Inspect *pkt* for port scan activity.
-        Returns an Alert if a scan is detected, else None.
-        """
-        # Only care about TCP/UDP connection attempts
-        if pkt.protocol not in ("TCP", "UDP"):
+    def add(self, ts: float, dst_ip: str, dst_port: int, flow: FlowRecord) -> None:
+        self.attempts.append((ts, dst_ip, dst_port, flow))
+        self.port_counts[dst_port] += 1
+        self.host_counts[dst_ip] += 1
+
+    def prune(self, cutoff: float) -> None:
+        attempts = self.attempts
+        while attempts and attempts[0][0] < cutoff:
+            _, dst_ip, dst_port, _ = attempts.popleft()
+            self.port_counts[dst_port] -= 1
+            if self.port_counts[dst_port] <= 0:
+                del self.port_counts[dst_port]
+            self.host_counts[dst_ip] -= 1
+            if self.host_counts[dst_ip] <= 0:
+                del self.host_counts[dst_ip]
+
+    @property
+    def fan_out(self) -> int:
+        return len(self.port_counts)
+
+
+class PortScanDetector:
+    """Flow-aware sliding-window port scan detector (static or adaptive)."""
+
+    def __init__(self, cfg: Settings = default_settings, mode: str = "adaptive") -> None:
+        self._cfg = cfg
+        self.mode = mode
+        self._windows: dict[str, _SourceWindow] = {}
+        self._last_alert: dict[str, float] = {}
+        self._baselines = BaselineTable(
+            alpha=cfg.baseline_alpha,
+            k=cfg.baseline_z_threshold,
+            warmup=cfg.baseline_warmup_samples,
+            floor=float(cfg.port_scan_adaptive_floor),
+            min_std=1.0,
+            cold_clip=float(cfg.port_scan_threshold),
+        )
+
+    # ------------------------------------------------------------------ #
+    # Per packet
+    # ------------------------------------------------------------------ #
+
+    def process(self, pkt: PacketRecord, event: Optional[FlowEvent]) -> Optional[Alert]:
+        if event is None or not event.connection_attempt:
             return None
-        if not pkt.src_ip or not pkt.dst_ip or pkt.dst_port is None:
+        flow = event.flow
+        if flow.dst_port is None:
             return None
 
         now = pkt.timestamp
-        window = settings.port_scan_window_s
-        threshold = settings.port_scan_threshold
+        src = flow.src_ip
+        win = self._windows.get(src)
+        if win is None:
+            win = self._windows[src] = _SourceWindow()
+        win.prune(now - self._cfg.port_scan_window_s)
+        win.add(now, flow.dst_ip, flow.dst_port, flow)
 
-        with self._lock:
-            src = pkt.src_ip
+        if now - self._last_alert.get(src, float("-inf")) < self._cfg.port_scan_cooldown_s:
+            return None
 
-            # Cooldown check
-            last = self._last_alert.get(src, 0)
-            if now - last < window:
+        fan_out = win.fan_out
+        if self.mode == "static":
+            threshold = float(self._cfg.port_scan_threshold)
+            if fan_out < threshold:
                 return None
+            return self._alert(now, src, win, fan_out, threshold, None, None)
 
-            buf = self._activity[src]
+        baseline, scope = self._baselines.for_key(src)
+        threshold = baseline.threshold()
+        if fan_out < threshold:
+            return None
+        return self._alert(
+            now, src, win, fan_out, threshold, baseline.view(scope), baseline.z_score(fan_out)
+        )
 
-            # Prune entries outside the sliding window
-            cutoff = now - window
-            while buf and buf[0][0] < cutoff:
-                buf.popleft()
+    # ------------------------------------------------------------------ #
+    # Per tick — learn baselines, drop idle sources
+    # ------------------------------------------------------------------ #
 
-            buf.append((now, pkt.dst_ip, pkt.dst_port))
+    def tick(self, now: float) -> None:
+        cutoff = now - self._cfg.port_scan_window_s
+        for src in list(self._windows.keys()):
+            win = self._windows[src]
+            win.prune(cutoff)
+            fan_out = win.fan_out
+            if fan_out == 0:
+                del self._windows[src]
+                continue
+            self._baselines.update(src, fan_out)
+            self._baselines.update_population(fan_out)
 
-            # Count distinct (dst_ip, dst_port) pairs
-            distinct_ports = len({(dst_ip, dport) for _, dst_ip, dport in buf})
+        cooldown_cutoff = now - self._cfg.port_scan_cooldown_s
+        for src in [s for s, t in self._last_alert.items() if t < cooldown_cutoff]:
+            del self._last_alert[src]
 
-            if distinct_ports >= threshold:
-                # Determine the primary scan target (most-contacted dst_ip)
-                dst_count: dict[str, int] = defaultdict(int)
-                for _, dst, _ in buf:
-                    dst_count[dst] += 1
-                top_target = max(dst_count, key=lambda k: dst_count[k])
+    def baseline_summary(self) -> dict:
+        return {
+            "population": self._baselines.population.view("network").to_dict(),
+            "tracked_sources": len(self._baselines),
+            "current_threshold": round(self._baselines.population.threshold(), 2),
+        }
 
-                self._last_alert[src] = now
-                self._activity[src].clear()  # Reset after alert
+    # ------------------------------------------------------------------ #
+    # Alert construction
+    # ------------------------------------------------------------------ #
 
-                return Alert(
-                    alert_type="PORT_SCAN",
-                    severity="HIGH",
-                    source_ip=src,
-                    target_ip=top_target,
-                    description=(
-                        f"Possible port scan: {src} contacted {distinct_ports} "
-                        f"distinct ports within {window:.0f}s."
-                    ),
-                    evidence={
-                        "distinct_ports_contacted": distinct_ports,
-                        "window_seconds": window,
-                        "threshold": threshold,
-                        "primary_target": top_target,
-                    },
-                )
+    def _alert(self, now, src, win, fan_out, threshold, baseline, z) -> Alert:
+        self._last_alert[src] = now
+        cfg = self._cfg
+        window = cfg.port_scan_window_s
 
-        return None
+        tcp_attempts = [a for a in win.attempts if a[3].transport == "TCP"]
+        failed = sum(
+            1 for a in tcp_attempts
+            if a[3].tcp_state in ("RESET", "SYN_SENT", "SYN_RECEIVED")
+            and not a[3].handshake_completed
+        )
+        failed_ratio = failed / len(tcp_attempts) if tcp_attempts else 0.0
+        top_target, top_hits = win.host_counts.most_common(1)[0]
+        n_targets = len(win.host_counts)
+        sample_ports = sorted(win.port_counts.keys())[:20]
+        first_ts = win.attempts[0][0] if win.attempts else now
+        duration = max(0.0, now - first_ts)
+        kind = "vertical scan of one host" if n_targets == 1 else f"sweep across {n_targets} hosts"
+
+        severity = "HIGH" if failed_ratio >= 0.5 or fan_out >= 3 * threshold else "MEDIUM"
+
+        factors = [
+            f"{fan_out} distinct destination ports in {duration:.1f}s ({kind}).",
+            f"{failed_ratio:.0%} of TCP attempts were refused or unanswered "
+            f"({failed}/{len(tcp_attempts)}).",
+            f"Sample ports: {', '.join(map(str, sample_ports))}"
+            + (" …" if fan_out > len(sample_ports) else ""),
+        ]
+        if baseline is not None:
+            rule = "fan_out ≥ max(floor, μ + k·σ)"
+            summary = (
+                f"{src} contacted {fan_out} distinct ports in {window:.0f}s; normal for "
+                f"{'this host' if baseline.scope == 'per-host' else 'hosts on this network'} "
+                f"is {baseline.mean:.1f} ± {baseline.std:.1f}, so the adaptive "
+                f"threshold was {threshold:.1f}."
+            )
+        else:
+            rule = f"fan_out ≥ {int(threshold)} (fixed)"
+            summary = (
+                f"{src} contacted {fan_out} distinct ports in {window:.0f}s, "
+                f"above the fixed threshold of {int(threshold)}."
+            )
+
+        return Alert(
+            timestamp=now,
+            alert_type="PORT_SCAN",
+            severity=severity,
+            mode=self.mode,
+            source_ip=src,
+            target_ip=top_target,
+            description=(
+                f"Possible port scan: {src} contacted {fan_out} distinct ports "
+                f"within {window:.0f}s."
+            ),
+            evidence={
+                "distinct_ports_contacted": fan_out,
+                "distinct_targets": n_targets,
+                "primary_target": top_target,
+                "primary_target_attempts": top_hits,
+                "failed_ratio": round(failed_ratio, 3),
+                "window_seconds": window,
+                "threshold": round(threshold, 2),
+                "sample_ports": sample_ports,
+                "duration_seconds": round(duration, 2),
+            },
+            explanation=explain(
+                summary=summary,
+                metric=f"distinct destination ports per source in {window:.0f}s",
+                observed=fan_out,
+                threshold=threshold,
+                rule=rule,
+                baseline=baseline,
+                z_score=z,
+                factors=factors,
+            ),
+        )

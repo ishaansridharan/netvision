@@ -167,3 +167,17 @@ netvision.db
 *.db
 *.db-journal
 *.sqlite3
+*.db-wal
+*.db-shm
+
+# Frontend
+node_modules/
+frontend/dist/
+
+# Captures and evaluation output (large / generated — keep labels you write by hand)
+captures/*
+!captures/.gitkeep
+!captures/*.labels.json
+captures/sample.labels.json
+evaluation/results/
+*.tsbuildinfo

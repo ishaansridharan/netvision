@@ -1,0 +1,12 @@
+[project]
+name = "netvision"
+version = "2.0.0"
+description = "Real-time flow-aware network monitoring with explainable, adaptive anomaly detection"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
+markers = ["slow: end-to-end tests that generate a capture (deselect with -m 'not slow')"]

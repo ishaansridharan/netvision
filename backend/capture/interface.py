@@ -124,6 +124,82 @@ def get_default_interface() -> str | None:
     return None
 
 
+def interface_addressing(name: str) -> tuple[list[str], list[str]]:
+    """
+    Return (ipv4_addresses, ipv4_networks_in_cidr) bound to interface *name*.
+    Used to decide which traffic is "ours" (upload vs download).
+    """
+    ips: list[str] = []
+    nets: list[str] = []
+    for addr in psutil.net_if_addrs().get(name, []):
+        if addr.family != socket.AF_INET or not addr.address:
+            continue
+        ips.append(addr.address)
+        if addr.netmask:
+            try:
+                net = ipaddress.ip_network(f"{addr.address}/{addr.netmask}", strict=False)
+                nets.append(str(net))
+            except ValueError:
+                pass
+    return ips, nets
+
+
+def default_gateway() -> str | None:
+    """Best-effort IPv4 default gateway (Linux /proc, then Scapy's routing table)."""
+    try:
+        with open("/proc/net/route") as fh:
+            for line in fh.readlines()[1:]:
+                fields = line.split()
+                if len(fields) >= 3 and fields[1] == "00000000":
+                    gw = int(fields[2], 16)
+                    if gw:
+                        return socket.inet_ntoa(gw.to_bytes(4, "little"))
+    except OSError:
+        pass
+    try:
+        from scapy.all import conf  # type: ignore[import]
+        gw = conf.route.route("0.0.0.0")[2]
+        if gw and gw != "0.0.0.0":
+            return gw
+    except Exception:
+        pass
+    return None
+
+
+def read_os_arp_cache() -> dict[str, str]:
+    """
+    Read the operating system's ARP cache as {ip: mac}.  Used to seed the
+    ARP detector with mappings that existed before capture started, so the
+    first spoofed reply is recognised as a change rather than learned.
+    """
+    table: dict[str, str] = {}
+    try:
+        with open("/proc/net/arp") as fh:
+            for line in fh.readlines()[1:]:
+                fields = line.split()
+                # IP, HW type, Flags, HW address, Mask, Device
+                if len(fields) >= 4 and fields[2] != "0x0":
+                    table[fields[0]] = fields[3].lower()
+        return table
+    except OSError:
+        pass
+    if platform.system() == "Windows":
+        import re
+        import subprocess
+        try:
+            out = subprocess.run(
+                ["arp", "-a"], capture_output=True, text=True, timeout=5
+            ).stdout
+            for ip, mac in re.findall(
+                r"(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5})\s+dynamic",
+                out,
+            ):
+                table[ip] = mac.replace("-", ":").lower()
+        except Exception:
+            pass
+    return table
+
+
 def check_npcap() -> dict:
     """
     On Windows, verify that Npcap (or WinPcap) is installed by attempting
